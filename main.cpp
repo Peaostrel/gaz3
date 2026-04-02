@@ -17,7 +17,10 @@ using namespace std;
 SQLHENV hEnv = SQL_NULL_HENV;
 SQLHDBC hDbc = SQL_NULL_HDBC;
 SQLHSTMT hStmt = SQL_NULL_HSTMT;
-string currentDSN = "ByteKeeperDSN";
+
+// Строка прямого подключения (DSN-less). 
+// Если не сработает localhost, поменяй SERVER=localhost на SERVER=.\\SQLEXPRESS
+string currentConnStr = "DRIVER={SQL Server};SERVER=localhost;DATABASE=ByteKeeperDB;Trusted_Connection=yes;";
 
 // === Утилиты ===
 void SetColor(int textColor) {
@@ -26,9 +29,9 @@ void SetColor(int textColor) {
 }
 
 wstring StringToWString(const string& s) {
-    int len = MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, NULL, 0);
+    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, NULL, 0);
     wchar_t* buf = new wchar_t[len];
-    MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, buf, len);
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, buf, len);
     wstring r(buf);
     delete[] buf;
     return r;
@@ -46,14 +49,24 @@ void DisconnectDB() {
     if (hEnv) { SQLFreeHandle(SQL_HANDLE_ENV, hEnv); hEnv = SQL_NULL_HENV; }
 }
 
-bool ConnectDB(const string& dsnName) {
+// Переписано на прямое подключение (SQLDriverConnect)
+bool ConnectDB(const string& connString) {
     SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &hEnv);
     SQLSetEnvAttr(hEnv, SQL_ATTR_ODBC_VERSION, (SQLPOINTER)SQL_OV_ODBC3, 0);
     SQLAllocHandle(SQL_HANDLE_DBC, hEnv, &hDbc);
-    wstring wDsn = StringToWString(dsnName);
-    if (SQL_SUCCEEDED(SQLConnect(hDbc, (SQLWCHAR*)wDsn.c_str(), SQL_NTS, NULL, 0, NULL, 0))) {
+    
+    wstring wConnStr = StringToWString(connString);
+    SQLWCHAR outConnStr[1024];
+    SQLSMALLINT outConnStrLen;
+
+    SQLRETURN retCode = SQLDriverConnect(
+        hDbc, NULL, (SQLWCHAR*)wConnStr.c_str(), SQL_NTS, 
+        outConnStr, 1024, &outConnStrLen, SQL_DRIVER_NOPROMPT
+    );
+
+    if (SQL_SUCCEEDED(retCode)) {
         SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hStmt);
-        currentDSN = dsnName;
+        currentConnStr = connString;
         return true;
     }
     DisconnectDB();
@@ -73,15 +86,19 @@ void LogAction(const wstring& actionDesc) {
 
 // === Группа Г: Смена базы на лету ===
 void ChangeDatabase() {
-    string newDsn;
-    cout << "Введите имя нового DSN для подключения: ";
-    cin >> newDsn;
+    string newDB;
+    cout << "Введите имя новой базы данных на этом сервере (например, master): ";
+    cin >> newDB;
+    
+    // Формируем новую строку подключения, меняя только название базы
+    string newConnStr = "DRIVER={SQL Server};SERVER=localhost;DATABASE=" + newDB + ";Trusted_Connection=yes;";
+    
     DisconnectDB();
-    if (ConnectDB(newDsn)) {
-        SetColor(2); cout << "Успешно подключено к " << newDsn << "\n"; SetColor(7);
+    if (ConnectDB(newConnStr)) {
+        SetColor(2); cout << "Успешно подключено к БД: " << newDB << "\n"; SetColor(7);
     } else {
-        SetColor(4); cout << "Ошибка подключения! Возврат к старому DSN.\n"; SetColor(7);
-        ConnectDB(currentDSN);
+        SetColor(4); cout << "Ошибка подключения! Возврат к старой БД.\n"; SetColor(7);
+        ConnectDB(currentConnStr);
     }
 }
 
@@ -89,9 +106,7 @@ void ChangeDatabase() {
 void CleanOldData() {
     SQLHSTMT hClean;
     SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hClean);
-    // Предлагаем удалить записи старше 30 дней
     wstring query = L"UPDATE Resources SET isDeleted = 1 WHERE DATEDIFF(day, UploadDate, GETDATE()) > 30 AND isDeleted = 0";
-    // ИСПРАВЛЕНО: SQLExecDirect вместо SQLExecuteDirect
     if (SQL_SUCCEEDED(SQLExecDirect(hClean, (SQLWCHAR*)query.c_str(), SQL_NTS))) {
         SQLLEN rowCount = 0;
         SQLRowCount(hClean, &rowCount);
@@ -106,7 +121,6 @@ void SearchResources(const wstring& searchInput) {
     SQLHSTMT hSearch;
     SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hSearch);
     
-    // Заменяем пробелы на '%' для мульти-поиска (например: "отчет 2023" -> "%отчет%2023%")
     wstring mask = L"%" + regex_replace(searchInput, wregex(L" "), L"%") + L"%";
 
     wstring query = L"SELECT ResourceID, Name, Size FROM Resources WHERE Name LIKE ? AND isDeleted = 0";
@@ -138,7 +152,6 @@ void ExportData() {
     SQLHSTMT hExp;
     SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hExp);
     wstring query = L"SELECT ResourceID, Name, Size FROM Resources WHERE isDeleted = 0";
-    // ИСПРАВЛЕНО: SQLExecDirect вместо SQLExecuteDirect
     SQLExecDirect(hExp, (SQLWCHAR*)query.c_str(), SQL_NTS);
 
     ofstream csv("export.csv");
@@ -155,10 +168,9 @@ void ExportData() {
 
     int count = 0;
     while (SQLFetch(hExp) == SQL_SUCCESS) {
-        // Чтобы wstring нормально писался в char потоки, конвертируем обратно
-        int len = WideCharToMultiByte(CP_ACP, 0, name, -1, NULL, 0, NULL, NULL);
+        int len = WideCharToMultiByte(CP_UTF8, 0, name, -1, NULL, 0, NULL, NULL);
         char* buf = new char[len];
-        WideCharToMultiByte(CP_ACP, 0, name, -1, buf, len, NULL, NULL);
+        WideCharToMultiByte(CP_UTF8, 0, name, -1, buf, len, NULL, NULL);
         string cName(buf); delete[] buf;
 
         csv << id << ";" << cName << ";" << size << "\n";
@@ -172,11 +184,15 @@ void ExportData() {
 }
 
 int main() {
-    SetConsoleOutputCP(1251);
-    SetConsoleCP(1251);
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
 
-    if (!ConnectDB(currentDSN)) {
-        SetColor(4); cout << "Критическая ошибка: Нет подключения к БД.\n"; SetColor(7); return 1;
+    if (!ConnectDB(currentConnStr)) {
+        SetColor(4); 
+        cout << "Критическая ошибка: Нет подключения к БД.\n"; 
+        cout << "Если у вас SQL Express, поменяйте в коде SERVER=localhost на SERVER=.\\\\SQLEXPRESS\n";
+        SetColor(7); 
+        return 1;
     }
 
     int choice = 0;
@@ -184,7 +200,7 @@ int main() {
         cout << "\n1. Поиск (LIKE)\n";
         cout << "2. Очистить старые файлы (DATEDIFF)\n";
         cout << "3. Экспорт в CSV и TXT\n";
-        cout << "4. Сменить базу данных (DSN)\n";
+        cout << "4. Сменить базу данных\n";
         cout << "9. Выход\nВыбор: ";
         
         if (!(cin >> choice)) {
