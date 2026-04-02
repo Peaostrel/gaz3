@@ -6,6 +6,7 @@
 #include <sqlext.h>
 #include <iomanip>
 #include <regex>
+#include <fstream>
 
 using namespace std;
 
@@ -13,6 +14,7 @@ using namespace std;
 SQLHENV hEnv = SQL_NULL_HENV;
 SQLHDBC hDbc = SQL_NULL_HDBC;
 SQLHSTMT hStmt = SQL_NULL_HSTMT;
+string currentDSN = "ByteKeeperDSN";
 
 // === Утилиты ===
 void SetColor(int textColor) {
@@ -29,7 +31,6 @@ wstring StringToWString(const string& s) {
     return r;
 }
 
-// Обрезка по ТЗ (до 15 символов + ...)
 wstring Truncate(const wstring& str) {
     if (str.length() > 15) return str.substr(0, 15) + L"...";
     return str;
@@ -49,6 +50,7 @@ bool ConnectDB(const string& dsnName) {
     wstring wDsn = StringToWString(dsnName);
     if (SQL_SUCCEEDED(SQLConnect(hDbc, (SQLWCHAR*)wDsn.c_str(), SQL_NTS, NULL, 0, NULL, 0))) {
         SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hStmt);
+        currentDSN = dsnName;
         return true;
     }
     DisconnectDB();
@@ -66,147 +68,126 @@ void LogAction(const wstring& actionDesc) {
     SQLFreeHandle(SQL_HANDLE_STMT, hLog);
 }
 
-// === Валидация (Группа Б) ===
-bool IsValidName(const wstring& name) {
-    wregex pattern(L"[\\\\/:*?\"<>|]");
-    return !regex_search(name, pattern);
-}
-
-bool IsAllowedExtension(const wstring& name) {
-    size_t pos = name.find_last_of(L".");
-    if (pos == wstring::npos && name.find(L"FOLDER") != wstring::npos) return true; // Разрешаем папки
-    if (pos == wstring::npos) return false;
-    wstring ext = name.substr(pos);
-    return (ext == L".exe" || ext == L".txt" || ext == L".pdf");
-}
-
-bool IsDuplicate(const wstring& name) {
-    SQLHSTMT hDup;
-    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hDup);
-    wstring query = L"SELECT COUNT(*) FROM Resources WHERE Name = ?";
-    SQLPrepare(hDup, (SQLWCHAR*)query.c_str(), SQL_NTS);
-    SQLLEN cb = SQL_NTS;
-    SQLBindParameter(hDup, 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR, 255, 0, (SQLPOINTER)name.c_str(), 0, &cb);
-    SQLExecute(hDup);
-    SQLINTEGER count = 0; SQLLEN cbCount = 0;
-    SQLBindCol(hDup, 1, SQL_C_SLONG, &count, 0, &cbCount);
-    SQLFetch(hDup);
-    SQLFreeHandle(SQL_HANDLE_STMT, hDup);
-    return count > 0;
-}
-
-// === CRUD и Статистика ===
-void AddResource(const wstring& name, long long size, int catId, int ownerId) {
-    if (!IsValidName(name)) { SetColor(4); wcout << L"Ошибка: Имя содержит запрещенные символы.\n"; SetColor(7); return; }
-    if (!IsAllowedExtension(name)) { SetColor(4); wcout << L"Ошибка: Расширение не в белом списке (.exe, .txt, .pdf).\n"; SetColor(7); return; }
-    if (IsDuplicate(name)) { SetColor(4); wcout << L"Ошибка: Файл с таким именем уже существует (Дубликат).\n"; SetColor(7); return; }
-
-    SQLHSTMT hIns;
-    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hIns);
-    wstring query = L"INSERT INTO Resources (Name, Size, CategoryID, OwnerID) VALUES (?, ?, ?, ?)";
-    SQLPrepare(hIns, (SQLWCHAR*)query.c_str(), SQL_NTS);
-    SQLLEN cb1 = SQL_NTS, cb2 = 0, cb3 = 0, cb4 = 0;
-    SQLBindParameter(hIns, 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR, 255, 0, (SQLPOINTER)name.c_str(), 0, &cb1);
-    SQLBindParameter(hIns, 2, SQL_PARAM_INPUT, SQL_C_SBIGINT, SQL_BIGINT, 0, 0, &size, 0, &cb2);
-    SQLBindParameter(hIns, 3, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &catId, 0, &cb3);
-    SQLBindParameter(hIns, 4, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &ownerId, 0, &cb4);
-
-    if (SQL_SUCCEEDED(SQLExecute(hIns))) {
-        SetColor(2); wcout << L"Успех: " << name << L" загружен.\n"; SetColor(7);
-        LogAction(L"Добавлен: " + name);
+// === Группа Г: Смена базы на лету ===
+void ChangeDatabase() {
+    string newDsn;
+    cout << "Введите имя нового DSN для подключения: ";
+    cin >> newDsn;
+    DisconnectDB();
+    if (ConnectDB(newDsn)) {
+        SetColor(2); cout << "Успешно подключено к " << newDsn << "\n"; SetColor(7);
+    } else {
+        SetColor(4); cout << "Ошибка подключения! Возврат к старому DSN.\n"; SetColor(7);
+        ConnectDB(currentDSN);
     }
-    SQLFreeHandle(SQL_HANDLE_STMT, hIns);
 }
 
-void ShowStatistics() {
-    SQLHSTMT hStat;
-    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hStat);
-    wstring query = L"SELECT COUNT(*), ISNULL(SUM(Size), 0) FROM Resources WHERE isDeleted = 0";
-    SQLExecuteDirect(hStat, (SQLWCHAR*)query.c_str(), SQL_NTS);
-    SQLINTEGER count = 0; SQLBIGINT totalSize = 0; SQLLEN cb1 = 0, cb2 = 0;
-    SQLBindCol(hStat, 1, SQL_C_SLONG, &count, 0, &cb1);
-    SQLBindCol(hStat, 2, SQL_C_SBIGINT, &totalSize, 0, &cb2);
-    
-    if (SQLFetch(hStat) == SQL_SUCCESS) {
-        SetColor(11);
-        cout << "\n--- СТАТИСТИКА БАЗЫ ---\n";
-        cout << "Всего активных файлов: " << count << "\n";
-        cout << "Общий объем (байт): " << totalSize << "\n-----------------------\n";
-        SetColor(7);
+// === Группа Б: Очистка старых данных (DATEDIFF) ===
+void CleanOldData() {
+    SQLHSTMT hClean;
+    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hClean);
+    // Предлагаем удалить записи старше 30 дней
+    wstring query = L"UPDATE Resources SET isDeleted = 1 WHERE DATEDIFF(day, UploadDate, GETDATE()) > 30 AND isDeleted = 0";
+    if (SQL_SUCCEEDED(SQLExecuteDirect(hClean, (SQLWCHAR*)query.c_str(), SQL_NTS))) {
+        SQLLEN rowCount = 0;
+        SQLRowCount(hClean, &rowCount);
+        SetColor(14); cout << "Очистка завершена. Отправлено в корзину старых файлов: " << rowCount << "\n"; SetColor(7);
+        if (rowCount > 0) LogAction(L"Очистка старых файлов (>1 месяца)");
     }
-    SQLFreeHandle(SQL_HANDLE_STMT, hStat);
+    SQLFreeHandle(SQL_HANDLE_STMT, hClean);
 }
 
-// Динамическая ширина + Постраничный вывод
-void ShowResourcesPaged(int page, int limit) {
-    SQLHSTMT hPage;
-    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hPage);
+// === Группа А и Д: Интеллектуальный поиск (LIKE) ===
+void SearchResources(const wstring& searchInput) {
+    SQLHSTMT hSearch;
+    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hSearch);
     
-    // Сначала узнаем макс длину для setw (Требование В)
-    wstring qMax = L"SELECT ISNULL(MAX(LEN(Name)), 10) FROM Resources WHERE isDeleted = 0";
-    SQLExecuteDirect(hPage, (SQLWCHAR*)qMax.c_str(), SQL_NTS);
-    SQLINTEGER maxLen = 10; SQLLEN cbMax = 0;
-    SQLBindCol(hPage, 1, SQL_C_SLONG, &maxLen, 0, &cbMax);
-    SQLFetch(hPage);
-    SQLFreeHandle(SQL_HANDLE_STMT, hPage);
-    if (maxLen > 18) maxLen = 18; // С учетом обрезки до 15 + "..."
+    // Заменяем пробелы на '%' для мульти-поиска (например: "отчет 2023" -> "%отчет%2023%")
+    wstring mask = L"%" + regex_replace(searchInput, wregex(L" "), L"%") + L"%";
 
-    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hPage);
-    wstring query = L"SELECT ResourceID, Name, Size FROM Resources WHERE isDeleted = 0 ORDER BY ResourceID OFFSET ? ROWS FETCH NEXT ? ROWS ONLY";
-    SQLPrepare(hPage, (SQLWCHAR*)query.c_str(), SQL_NTS);
+    wstring query = L"SELECT ResourceID, Name, Size FROM Resources WHERE Name LIKE ? AND isDeleted = 0";
+    SQLPrepare(hSearch, (SQLWCHAR*)query.c_str(), SQL_NTS);
     
-    int offset = (page - 1) * limit;
-    SQLLEN cbOff = 0, cbLim = 0;
-    SQLBindParameter(hPage, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &offset, 0, &cbOff);
-    SQLBindParameter(hPage, 2, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &limit, 0, &cbLim);
+    SQLLEN cbMask = SQL_NTS;
+    SQLBindParameter(hSearch, 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR, 255, 0, (SQLPOINTER)mask.c_str(), 0, &cbMask);
     
-    SQLExecute(hPage);
-    
-    SQLINTEGER id; SQLWCHAR name[256]; SQLBIGINT size; SQLLEN cbId = 0, cbName = 0, cbSize = 0;
-    SQLBindCol(hPage, 1, SQL_C_SLONG, &id, 0, &cbId);
-    SQLBindCol(hPage, 2, SQL_C_WCHAR, name, sizeof(name), &cbName);
-    SQLBindCol(hPage, 3, SQL_C_SBIGINT, &size, 0, &cbSize);
+    if (SQL_SUCCEEDED(SQLExecute(hSearch))) {
+        SQLINTEGER id; SQLWCHAR name[256]; SQLBIGINT size; 
+        SQLLEN cbId = 0, cbName = 0, cbSize = 0;
+        SQLBindCol(hSearch, 1, SQL_C_SLONG, &id, 0, &cbId);
+        SQLBindCol(hSearch, 2, SQL_C_WCHAR, name, sizeof(name), &cbName);
+        SQLBindCol(hSearch, 3, SQL_C_SBIGINT, &size, 0, &cbSize);
 
-    cout << "\nСтраница " << page << " (Лимит: " << limit << ")\n";
-    cout << left << setw(5) << "ID" << setw(maxLen + 2) << "Имя" << "Размер\n";
-    cout << string(30, '-') << "\n";
-
-    bool hasData = false;
-    while (SQLFetch(hPage) == SQL_SUCCESS) {
-        hasData = true;
-        wstring wName(name);
-        wName = Truncate(wName);
-        
-        cout << left << setw(5) << id;
-        
-        if (wName.find(L"FOLDER") != wstring::npos) SetColor(14); // Желтый для папок
-        wcout << setw(maxLen + 2) << wName;
-        SetColor(7);
-        
-        cout << size << " B\n";
+        cout << "\n--- Результаты поиска ---\n";
+        bool found = false;
+        while (SQLFetch(hSearch) == SQL_SUCCESS) {
+            found = true;
+            wcout << L"ID: " << id << L" | Имя: " << Truncate(wstring(name)) << L" | Размер: " << size << L" B\n";
+        }
+        if (!found) cout << "Совпадений не найдено.\n";
     }
-    if (!hasData) cout << "Пусто.\n";
-    cout << string(30, '-') << "\n";
-    SQLFreeHandle(SQL_HANDLE_STMT, hPage);
+    SQLFreeHandle(SQL_HANDLE_STMT, hSearch);
+}
+
+// === Группа В и Д: Экспорт (CSV и TXT) ===
+void ExportData() {
+    SQLHSTMT hExp;
+    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hExp);
+    wstring query = L"SELECT ResourceID, Name, Size FROM Resources WHERE isDeleted = 0";
+    SQLExecuteDirect(hExp, (SQLWCHAR*)query.c_str(), SQL_NTS);
+
+    ofstream csv("export.csv");
+    ofstream txt("report.txt");
+    
+    csv << "ID;Имя файла;Размер(Байт)\n";
+    txt << left << setw(10) << "ID" << setw(30) << "Имя файла" << "Размер\n";
+    txt << string(60, '-') << "\n";
+
+    SQLINTEGER id; SQLWCHAR name[256]; SQLBIGINT size; SQLLEN cbId=0, cbName=0, cbSize=0;
+    SQLBindCol(hExp, 1, SQL_C_SLONG, &id, 0, &cbId);
+    SQLBindCol(hExp, 2, SQL_C_WCHAR, name, sizeof(name), &cbName);
+    SQLBindCol(hExp, 3, SQL_C_SBIGINT, &size, 0, &cbSize);
+
+    int count = 0;
+    while (SQLFetch(hExp) == SQL_SUCCESS) {
+        // Чтобы wstring нормально писался в char потоки, конвертируем обратно
+        int len = WideCharToMultiByte(CP_ACP, 0, name, -1, NULL, 0, NULL, NULL);
+        char* buf = new char[len];
+        WideCharToMultiByte(CP_ACP, 0, name, -1, buf, len, NULL, NULL);
+        string cName(buf); delete[] buf;
+
+        csv << id << ";" << cName << ";" << size << "\n";
+        txt << left << setw(10) << id << setw(30) << cName << size << "\n";
+        count++;
+    }
+    
+    csv.close(); txt.close();
+    SetColor(2); cout << "Экспорт завершен! Выгружено " << count << " записей в export.csv и report.txt\n"; SetColor(7);
+    SQLFreeHandle(SQL_HANDLE_STMT, hExp);
+}
+
+// === Заглушка добавления (для меню) ===
+void AddTestFile() {
+    // В реальном проекте здесь будет cin имени, размера и т.д.
+    cout << "Функция добавления (демо). Проверьте предыдущие коммиты для полной валидации.\n";
 }
 
 int main() {
     SetConsoleOutputCP(1251);
     SetConsoleCP(1251);
 
-    if (!ConnectDB("ByteKeeperDSN")) {
-        SetColor(4); cout << "Критическая ошибка: Нет подключения к БД.\n"; SetColor(7);
-        return 1;
+    if (!ConnectDB(currentDSN)) {
+        SetColor(4); cout << "Критическая ошибка: Нет подключения к БД.\n"; SetColor(7); return 1;
     }
 
     int choice = 0;
-    int currentPage = 1;
     while (choice != 9) {
-        cout << "\n1. Добавить файл (С проверками)\n";
-        cout << "2. Показать статистику (COUNT/SUM)\n";
-        cout << "3. Страница вперед (Пагинация)\n";
-        cout << "4. Страница назад\n";
+        cout << "\n1. Поиск (LIKE)\n";
+        cout << "2. Очистить старые файлы (DATEDIFF)\n";
+        cout << "3. Экспорт в CSV и TXT\n";
+        cout << "4. Сменить базу данных (DSN)\n";
         cout << "9. Выход\nВыбор: ";
+        
         if (!(cin >> choice)) {
             cin.clear(); cin.ignore(10000, '\n');
             SetColor(4); cout << "Ошибка: Введите число!\n"; SetColor(7);
@@ -214,13 +195,15 @@ int main() {
         }
 
         if (choice == 1) {
-            AddResource(L"report_fin.pdf", 5000, 1, 1);
-            AddResource(L"virus.sh", 120, 1, 1); // Не пройдет
-            AddResource(L"MY_FOLDER", 0, 1, 1); // Папка (желтая)
+            string req;
+            cout << "Введите фразу для поиска: ";
+            cin.ignore();
+            getline(cin, req);
+            SearchResources(StringToWString(req));
         }
-        else if (choice == 2) ShowStatistics();
-        else if (choice == 3) { currentPage++; ShowResourcesPaged(currentPage, 3); }
-        else if (choice == 4) { if(currentPage > 1) currentPage--; ShowResourcesPaged(currentPage, 3); }
+        else if (choice == 2) CleanOldData();
+        else if (choice == 3) ExportData();
+        else if (choice == 4) ChangeDatabase();
         else if (choice == 9) break;
     }
 
