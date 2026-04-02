@@ -8,6 +8,9 @@
 #include <regex>
 #include <fstream>
 
+// Указываем линковщику подключить библиотеку ODBC
+#pragma comment(lib, "odbc32.lib")
+
 using namespace std;
 
 // === Глобальные переменные ===
@@ -88,7 +91,8 @@ void CleanOldData() {
     SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hClean);
     // Предлагаем удалить записи старше 30 дней
     wstring query = L"UPDATE Resources SET isDeleted = 1 WHERE DATEDIFF(day, UploadDate, GETDATE()) > 30 AND isDeleted = 0";
-    if (SQL_SUCCEEDED(SQLExecuteDirect(hClean, (SQLWCHAR*)query.c_str(), SQL_NTS))) {
+    // ИСПРАВЛЕНО: SQLExecDirect вместо SQLExecuteDirect
+    if (SQL_SUCCEEDED(SQLExecDirect(hClean, (SQLWCHAR*)query.c_str(), SQL_NTS))) {
         SQLLEN rowCount = 0;
         SQLRowCount(hClean, &rowCount);
         SetColor(14); cout << "Очистка завершена. Отправлено в корзину старых файлов: " << rowCount << "\n"; SetColor(7);
@@ -134,7 +138,8 @@ void ExportData() {
     SQLHSTMT hExp;
     SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hExp);
     wstring query = L"SELECT ResourceID, Name, Size FROM Resources WHERE isDeleted = 0";
-    SQLExecuteDirect(hExp, (SQLWCHAR*)query.c_str(), SQL_NTS);
+    // ИСПРАВЛЕНО: SQLExecDirect вместо SQLExecuteDirect
+    SQLExecDirect(hExp, (SQLWCHAR*)query.c_str(), SQL_NTS);
 
     ofstream csv("export.csv");
     ofstream txt("report.txt");
@@ -164,12 +169,6 @@ void ExportData() {
     csv.close(); txt.close();
     SetColor(2); cout << "Экспорт завершен! Выгружено " << count << " записей в export.csv и report.txt\n"; SetColor(7);
     SQLFreeHandle(SQL_HANDLE_STMT, hExp);
-}
-
-// === Заглушка добавления (для меню) ===
-void AddTestFile() {
-    // В реальном проекте здесь будет cin имени, размера и т.д.
-    cout << "Функция добавления (демо). Проверьте предыдущие коммиты для полной валидации.\n";
 }
 
 int main() {
