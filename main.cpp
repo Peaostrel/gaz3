@@ -14,15 +14,6 @@ SQLHENV hEnv = SQL_NULL_HENV;
 SQLHDBC hDbc = SQL_NULL_HDBC;
 SQLHSTMT hStmt = SQL_NULL_HSTMT;
 
-struct Resource {
-    int ResourceID;
-    wstring Name;
-    long long Size;
-    int CategoryID;
-    int OwnerID;
-    bool isDeleted;
-};
-
 // === Утилиты ===
 void SetColor(int textColor) {
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -30,14 +21,18 @@ void SetColor(int textColor) {
 }
 
 wstring StringToWString(const string& s) {
-    int len;
-    int slength = (int)s.length() + 1;
-    len = MultiByteToWideChar(CP_ACP, 0, s.c_str(), slength, 0, 0);
+    int len = MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, NULL, 0);
     wchar_t* buf = new wchar_t[len];
-    MultiByteToWideChar(CP_ACP, 0, s.c_str(), slength, buf, len);
+    MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, buf, len);
     wstring r(buf);
     delete[] buf;
     return r;
+}
+
+// Обрезка по ТЗ (до 15 символов + ...)
+wstring Truncate(const wstring& str) {
+    if (str.length() > 15) return str.substr(0, 15) + L"...";
+    return str;
 }
 
 // === Работа с БД ===
@@ -51,11 +46,8 @@ bool ConnectDB(const string& dsnName) {
     SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &hEnv);
     SQLSetEnvAttr(hEnv, SQL_ATTR_ODBC_VERSION, (SQLPOINTER)SQL_OV_ODBC3, 0);
     SQLAllocHandle(SQL_HANDLE_DBC, hEnv, &hDbc);
-
-    wstring wDsnName = StringToWString(dsnName);
-    SQLRETURN retCode = SQLConnect(hDbc, (SQLWCHAR*)wDsnName.c_str(), SQL_NTS, NULL, 0, NULL, 0);
-    
-    if (SQL_SUCCEEDED(retCode)) {
+    wstring wDsn = StringToWString(dsnName);
+    if (SQL_SUCCEEDED(SQLConnect(hDbc, (SQLWCHAR*)wDsn.c_str(), SQL_NTS, NULL, 0, NULL, 0))) {
         SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hStmt);
         return true;
     }
@@ -63,112 +55,173 @@ bool ConnectDB(const string& dsnName) {
     return false;
 }
 
-// --- Автоматическое логирование ---
 void LogAction(const wstring& actionDesc) {
-    SQLHSTMT hStmtLog = SQL_NULL_HSTMT;
-    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hStmtLog);
-    
+    SQLHSTMT hLog;
+    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hLog);
     wstring query = L"INSERT INTO Logs (ActionDescription) VALUES (?)";
-    SQLPrepare(hStmtLog, (SQLWCHAR*)query.c_str(), SQL_NTS);
-    
-    SQLLEN cbDesc = SQL_NTS;
-    SQLBindParameter(hStmtLog, 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR, 255, 0, (SQLPOINTER)actionDesc.c_str(), 0, &cbDesc);
-    
-    SQLExecute(hStmtLog);
-    SQLFreeHandle(SQL_HANDLE_STMT, hStmtLog);
+    SQLPrepare(hLog, (SQLWCHAR*)query.c_str(), SQL_NTS);
+    SQLLEN cb = SQL_NTS;
+    SQLBindParameter(hLog, 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR, 255, 0, (SQLPOINTER)actionDesc.c_str(), 0, &cb);
+    SQLExecute(hLog);
+    SQLFreeHandle(SQL_HANDLE_STMT, hLog);
 }
 
-// --- Добавление с параметризацией (Защита от инъекций) ---
-void AddResource(const wstring& name, long long size, int categoryId, int ownerId) {
-    SQLHSTMT hStmtInsert = SQL_NULL_HSTMT;
-    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hStmtInsert);
+// === Валидация (Группа Б) ===
+bool IsValidName(const wstring& name) {
+    wregex pattern(L"[\\\\/:*?\"<>|]");
+    return !regex_search(name, pattern);
+}
 
+bool IsAllowedExtension(const wstring& name) {
+    size_t pos = name.find_last_of(L".");
+    if (pos == wstring::npos && name.find(L"FOLDER") != wstring::npos) return true; // Разрешаем папки
+    if (pos == wstring::npos) return false;
+    wstring ext = name.substr(pos);
+    return (ext == L".exe" || ext == L".txt" || ext == L".pdf");
+}
+
+bool IsDuplicate(const wstring& name) {
+    SQLHSTMT hDup;
+    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hDup);
+    wstring query = L"SELECT COUNT(*) FROM Resources WHERE Name = ?";
+    SQLPrepare(hDup, (SQLWCHAR*)query.c_str(), SQL_NTS);
+    SQLLEN cb = SQL_NTS;
+    SQLBindParameter(hDup, 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR, 255, 0, (SQLPOINTER)name.c_str(), 0, &cb);
+    SQLExecute(hDup);
+    SQLINTEGER count = 0; SQLLEN cbCount = 0;
+    SQLBindCol(hDup, 1, SQL_C_SLONG, &count, 0, &cbCount);
+    SQLFetch(hDup);
+    SQLFreeHandle(SQL_HANDLE_STMT, hDup);
+    return count > 0;
+}
+
+// === CRUD и Статистика ===
+void AddResource(const wstring& name, long long size, int catId, int ownerId) {
+    if (!IsValidName(name)) { SetColor(4); wcout << L"Ошибка: Имя содержит запрещенные символы.\n"; SetColor(7); return; }
+    if (!IsAllowedExtension(name)) { SetColor(4); wcout << L"Ошибка: Расширение не в белом списке (.exe, .txt, .pdf).\n"; SetColor(7); return; }
+    if (IsDuplicate(name)) { SetColor(4); wcout << L"Ошибка: Файл с таким именем уже существует (Дубликат).\n"; SetColor(7); return; }
+
+    SQLHSTMT hIns;
+    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hIns);
     wstring query = L"INSERT INTO Resources (Name, Size, CategoryID, OwnerID) VALUES (?, ?, ?, ?)";
-    SQLPrepare(hStmtInsert, (SQLWCHAR*)query.c_str(), SQL_NTS);
+    SQLPrepare(hIns, (SQLWCHAR*)query.c_str(), SQL_NTS);
+    SQLLEN cb1 = SQL_NTS, cb2 = 0, cb3 = 0, cb4 = 0;
+    SQLBindParameter(hIns, 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR, 255, 0, (SQLPOINTER)name.c_str(), 0, &cb1);
+    SQLBindParameter(hIns, 2, SQL_PARAM_INPUT, SQL_C_SBIGINT, SQL_BIGINT, 0, 0, &size, 0, &cb2);
+    SQLBindParameter(hIns, 3, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &catId, 0, &cb3);
+    SQLBindParameter(hIns, 4, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &ownerId, 0, &cb4);
 
-    SQLLEN cbName = SQL_NTS, cbSize = 0, cbCat = 0, cbOwner = 0;
-    
-    SQLBindParameter(hStmtInsert, 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR, 255, 0, (SQLPOINTER)name.c_str(), 0, &cbName);
-    SQLBindParameter(hStmtInsert, 2, SQL_PARAM_INPUT, SQL_C_SBIGINT, SQL_BIGINT, 0, 0, &size, 0, &cbSize);
-    SQLBindParameter(hStmtInsert, 3, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &categoryId, 0, &cbCat);
-    SQLBindParameter(hStmtInsert, 4, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &ownerId, 0, &cbOwner);
-
-    if (SQL_SUCCEEDED(SQLExecute(hStmtInsert))) {
-        SetColor(2);
-        wcout << L"Успех: Ресурс добавлен.\n";
-        LogAction(L"Добавлен ресурс: " + name);
-    } else {
-        SetColor(4);
-        cout << "Ошибка добавления ресурса в БД.\n";
+    if (SQL_SUCCEEDED(SQLExecute(hIns))) {
+        SetColor(2); wcout << L"Успех: " << name << L" загружен.\n"; SetColor(7);
+        LogAction(L"Добавлен: " + name);
     }
-    SetColor(7);
-    SQLFreeHandle(SQL_HANDLE_STMT, hStmtInsert);
+    SQLFreeHandle(SQL_HANDLE_STMT, hIns);
 }
 
-// --- Soft Delete (Корзина) ---
-void ToggleDeleteStatus(int resourceId, bool deleteFlag) {
-    SQLHSTMT hStmtToggle = SQL_NULL_HSTMT;
-    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hStmtToggle);
-
-    wstring query = L"UPDATE Resources SET isDeleted = ? WHERE ResourceID = ?";
-    SQLPrepare(hStmtToggle, (SQLWCHAR*)query.c_str(), SQL_NTS);
-
-    int flagVal = deleteFlag ? 1 : 0;
-    SQLLEN cbFlag = 0, cbId = 0;
+void ShowStatistics() {
+    SQLHSTMT hStat;
+    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hStat);
+    wstring query = L"SELECT COUNT(*), ISNULL(SUM(Size), 0) FROM Resources WHERE isDeleted = 0";
+    SQLExecuteDirect(hStat, (SQLWCHAR*)query.c_str(), SQL_NTS);
+    SQLINTEGER count = 0; SQLBIGINT totalSize = 0; SQLLEN cb1 = 0, cb2 = 0;
+    SQLBindCol(hStat, 1, SQL_C_SLONG, &count, 0, &cb1);
+    SQLBindCol(hStat, 2, SQL_C_SBIGINT, &totalSize, 0, &cb2);
     
-    SQLBindParameter(hStmtToggle, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &flagVal, 0, &cbFlag);
-    SQLBindParameter(hStmtToggle, 2, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &resourceId, 0, &cbId);
-
-    if (SQL_SUCCEEDED(SQLExecute(hStmtToggle))) {
-        SQLLEN rowCount = 0;
-        SQLRowCount(hStmtToggle, &rowCount);
-        if (rowCount > 0) {
-            SetColor(14); // Желтый
-            cout << (deleteFlag ? "Файл перемещен в корзину.\n" : "Файл восстановлен из корзины.\n");
-            wstring action = deleteFlag ? L"Удаление (Soft) ID: " : L"Восстановление ID: ";
-            LogAction(action + to_wstring(resourceId));
-        } else {
-            SetColor(4); cout << "Файл с таким ID не найден.\n";
-        }
+    if (SQLFetch(hStat) == SQL_SUCCESS) {
+        SetColor(11);
+        cout << "\n--- СТАТИСТИКА БАЗЫ ---\n";
+        cout << "Всего активных файлов: " << count << "\n";
+        cout << "Общий объем (байт): " << totalSize << "\n-----------------------\n";
+        SetColor(7);
     }
-    SetColor(7);
-    SQLFreeHandle(SQL_HANDLE_STMT, hStmtToggle);
+    SQLFreeHandle(SQL_HANDLE_STMT, hStat);
 }
 
-void PingServer() {
-    if (hDbc == SQL_NULL_HDBC) return;
-    SQLCHAR sqlState[6], msg[256];
-    SQLINTEGER nativeError;
-    SQLSMALLINT msgLen;
-    if (SQLGetDiagRec(SQL_HANDLE_DBC, hDbc, 1, sqlState, &nativeError, msg, sizeof(msg), &msgLen) == SQL_SUCCESS) {
-        SetColor(4); cout << "Пинг: Ошибка соединения (" << sqlState << ")\n"; SetColor(7);
+// Динамическая ширина + Постраничный вывод
+void ShowResourcesPaged(int page, int limit) {
+    SQLHSTMT hPage;
+    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hPage);
+    
+    // Сначала узнаем макс длину для setw (Требование В)
+    wstring qMax = L"SELECT ISNULL(MAX(LEN(Name)), 10) FROM Resources WHERE isDeleted = 0";
+    SQLExecuteDirect(hPage, (SQLWCHAR*)qMax.c_str(), SQL_NTS);
+    SQLINTEGER maxLen = 10; SQLLEN cbMax = 0;
+    SQLBindCol(hPage, 1, SQL_C_SLONG, &maxLen, 0, &cbMax);
+    SQLFetch(hPage);
+    SQLFreeHandle(SQL_HANDLE_STMT, hPage);
+    if (maxLen > 18) maxLen = 18; // С учетом обрезки до 15 + "..."
+
+    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hPage);
+    wstring query = L"SELECT ResourceID, Name, Size FROM Resources WHERE isDeleted = 0 ORDER BY ResourceID OFFSET ? ROWS FETCH NEXT ? ROWS ONLY";
+    SQLPrepare(hPage, (SQLWCHAR*)query.c_str(), SQL_NTS);
+    
+    int offset = (page - 1) * limit;
+    SQLLEN cbOff = 0, cbLim = 0;
+    SQLBindParameter(hPage, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &offset, 0, &cbOff);
+    SQLBindParameter(hPage, 2, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &limit, 0, &cbLim);
+    
+    SQLExecute(hPage);
+    
+    SQLINTEGER id; SQLWCHAR name[256]; SQLBIGINT size; SQLLEN cbId = 0, cbName = 0, cbSize = 0;
+    SQLBindCol(hPage, 1, SQL_C_SLONG, &id, 0, &cbId);
+    SQLBindCol(hPage, 2, SQL_C_WCHAR, name, sizeof(name), &cbName);
+    SQLBindCol(hPage, 3, SQL_C_SBIGINT, &size, 0, &cbSize);
+
+    cout << "\nСтраница " << page << " (Лимит: " << limit << ")\n";
+    cout << left << setw(5) << "ID" << setw(maxLen + 2) << "Имя" << "Размер\n";
+    cout << string(30, '-') << "\n";
+
+    bool hasData = false;
+    while (SQLFetch(hPage) == SQL_SUCCESS) {
+        hasData = true;
+        wstring wName(name);
+        wName = Truncate(wName);
+        
+        cout << left << setw(5) << id;
+        
+        if (wName.find(L"FOLDER") != wstring::npos) SetColor(14); // Желтый для папок
+        wcout << setw(maxLen + 2) << wName;
+        SetColor(7);
+        
+        cout << size << " B\n";
     }
+    if (!hasData) cout << "Пусто.\n";
+    cout << string(30, '-') << "\n";
+    SQLFreeHandle(SQL_HANDLE_STMT, hPage);
 }
 
 int main() {
     SetConsoleOutputCP(1251);
     SetConsoleCP(1251);
 
-    cout << "--- ByteKeeper: Система управления активами ---\n";
     if (!ConnectDB("ByteKeeperDSN")) {
-        SetColor(4); cout << "Критическая ошибка: Не удалось подключиться к ODBC DSN 'ByteKeeperDSN'.\n"; SetColor(7);
+        SetColor(4); cout << "Критическая ошибка: Нет подключения к БД.\n"; SetColor(7);
         return 1;
     }
 
-    SetColor(2); cout << "Подключение к БД установлено.\n\n"; SetColor(7);
-    
-    // Временное меню для тестов (пока без защиты ввода)
     int choice = 0;
+    int currentPage = 1;
     while (choice != 9) {
-        cout << "1. Добавить тестовый файл (Параметризация)\n";
-        cout << "2. Удалить файл в корзину (Soft Delete)\n";
-        cout << "3. Восстановить файл\n";
+        cout << "\n1. Добавить файл (С проверками)\n";
+        cout << "2. Показать статистику (COUNT/SUM)\n";
+        cout << "3. Страница вперед (Пагинация)\n";
+        cout << "4. Страница назад\n";
         cout << "9. Выход\nВыбор: ";
-        cin >> choice;
+        if (!(cin >> choice)) {
+            cin.clear(); cin.ignore(10000, '\n');
+            SetColor(4); cout << "Ошибка: Введите число!\n"; SetColor(7);
+            continue;
+        }
 
-        if (choice == 1) AddResource(L"TestDoc_2026.pdf", 1048576, 1, 1);
-        else if (choice == 2) ToggleDeleteStatus(1, true);
-        else if (choice == 3) ToggleDeleteStatus(1, false);
+        if (choice == 1) {
+            AddResource(L"report_fin.pdf", 5000, 1, 1);
+            AddResource(L"virus.sh", 120, 1, 1); // Не пройдет
+            AddResource(L"MY_FOLDER", 0, 1, 1); // Папка (желтая)
+        }
+        else if (choice == 2) ShowStatistics();
+        else if (choice == 3) { currentPage++; ShowResourcesPaged(currentPage, 3); }
+        else if (choice == 4) { if(currentPage > 1) currentPage--; ShowResourcesPaged(currentPage, 3); }
+        else if (choice == 9) break;
     }
 
     DisconnectDB();
