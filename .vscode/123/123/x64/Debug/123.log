@@ -1,0 +1,10 @@
+﻿  main.cpp
+C:\Users\PC100\Desktop\UP_Akinshin\3\main.cpp(1,9): warning C4005: UNICODE: изменение макроопределения
+      C:\Users\PC100\Desktop\UP_Akinshin\3\main.cpp(1,9):
+      "UNICODE" ранее объявлен в командной строке
+  
+C:\Users\PC100\Desktop\UP_Akinshin\3\main.cpp(2,9): warning C4005: _UNICODE: изменение макроопределения
+      C:\Users\PC100\Desktop\UP_Akinshin\3\main.cpp(2,9):
+      "_UNICODE" ранее объявлен в командной строке
+  
+  123.vcxproj -> C:\Users\PC100\Desktop\UP_Akinshin\3\.vscode\123\x64\Debug\123.exe
